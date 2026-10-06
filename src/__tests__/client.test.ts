@@ -1,8 +1,13 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 // Mock the Freshdesk SDK and logger so tests never make network calls.
+// vitest 5's mock-as-constructor path calls the implementation with `new`,
+// which arrow functions can never support — use a regular function so the
+// mock still works when invoked as `new FreshdeskClient(...)`.
 vi.mock('@wyre-technology/node-freshdesk', () => ({
-  FreshdeskClient: vi.fn().mockImplementation((opts: { domain: string; apiKey: string }) => ({ _opts: opts })),
+  FreshdeskClient: vi.fn().mockImplementation(function (opts: { domain: string; apiKey: string }) {
+    return { _opts: opts };
+  }),
 }));
 vi.mock('../utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
