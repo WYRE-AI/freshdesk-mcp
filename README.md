@@ -35,25 +35,52 @@ claude mcp add freshdesk-mcp \
 
 ## Connecting via the Gateway
 
-When `AUTH_MODE=gateway`, the server reads credentials from request headers injected by the WYRE MCP Gateway:
+When `AUTH_MODE=gateway`, every `/mcp` request must include credentials injected by the WYRE MCP Gateway. A request missing either header returns 401 and does not fall back to `FRESHDESK_DOMAIN` or `FRESHDESK_API_KEY` in the process environment.
 
 | Header | Maps to | Description |
 |--------|---------|-------------|
 | `x-freshdesk-domain` | `FRESHDESK_DOMAIN` | Freshdesk account subdomain |
 | `x-freshdesk-api-key` | `FRESHDESK_API_KEY` | Freshdesk API key |
 
-Each request is stateless: the gateway provides the credentials, the server rebuilds its Freshdesk client, and tool discovery (`tools/list`) works even before credentials are present.
+Each request is stateless: the gateway provides the credentials, and the server rebuilds its Freshdesk client for that request only. When `CONDUIT_S2S_SECRET` is set, the request must also include a valid `X-Gateway-S2S` header.
 
 ## Configuration
 
+Copy [`.env.example`](.env.example) and set the variables below. The stdio transport reads `FRESHDESK_DOMAIN` and `FRESHDESK_API_KEY` and does not use `CONDUIT_S2S_SECRET`.
+
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `FRESHDESK_DOMAIN` | Account subdomain (before `.freshdesk.com`) | — |
-| `FRESHDESK_API_KEY` | Freshdesk API key | — |
+| `FRESHDESK_DOMAIN` | Account subdomain (before `.freshdesk.com`). Required for stdio and for HTTP when `AUTH_MODE=env`. Gateway mode does not read it. | — |
+| `FRESHDESK_API_KEY` | Freshdesk API key. Required for stdio and for HTTP when `AUTH_MODE=env`. Gateway mode does not read it. | — |
 | `MCP_TRANSPORT` | Transport mode (`stdio` or `http`) | `stdio` |
+| `AUTH_MODE` | `env` (process environment) or `gateway` (per-request `x-freshdesk-domain` and `x-freshdesk-api-key`, no env fallback). The container image and Compose default to `gateway`. | `env` |
+| `CONDUIT_S2S_SECRET` | Required for HTTP. HMAC secret checked against `X-Gateway-S2S` on every `/mcp` request. The process logs an error and exits non-zero when this is empty or a known placeholder (`changeme`, `placeholder`, `secret`, `your-s2s-secret`, and similar public example values). Compose will not start when it is unset. Never commit a real value. Generate one with `openssl rand -hex 32`. The value is never logged. | — |
+| `MCP_ALLOW_INSECURE_DEV` | Set to exactly `1` only for local development to start HTTP without `CONDUIT_S2S_SECRET`. The process logs a warning, does not enforce `X-Gateway-S2S`, and binds `127.0.0.1` only. A wider `MCP_HTTP_HOST` (including `0.0.0.0`) is ignored and the override is logged. A known placeholder secret is still rejected. | — |
+| `MCP_HTTP_HOST` | Bind address when `MCP_TRANSPORT=http`. Unset binds `127.0.0.1`. A configured `CONDUIT_S2S_SECRET` honors this value (the container image sets `0.0.0.0`). With no secret, the insecure-dev bypass forces `127.0.0.1`. | `127.0.0.1` |
 | `MCP_HTTP_PORT` | HTTP server port | `8080` |
-| `AUTH_MODE` | Auth mode (`env` or `gateway`) | `env` |
 | `LOG_LEVEL` | Log level (`debug`, `info`, `warn`, `error`) | `info` |
+
+`/health` stays unauthenticated and does not read credentials.
+
+### HTTP authentication
+
+With `MCP_TRANSPORT=http` and `CONDUIT_S2S_SECRET` set, every `/mcp` request must include `X-Gateway-S2S`:
+
+```
+t=<unix seconds>,v1=<hex hmac-sha256>
+```
+
+`v1` is the lowercase hex HMAC-SHA256 of the ASCII message `t=<unix seconds>`, keyed by `CONDUIT_S2S_SECRET`. The timestamp must be within 300 seconds of the server clock. A missing or invalid header returns 401 before any vendor credential is read. The secret is never written to logs or error bodies.
+
+In `AUTH_MODE=gateway`, `/mcp` also requires `x-freshdesk-domain` and `x-freshdesk-api-key`. Those headers are the only credential source for the request. A missing header returns 401. The server does not fall back to `FRESHDESK_DOMAIN` or `FRESHDESK_API_KEY` in the process environment.
+
+```
+X-Gateway-S2S: t=1710000000,v1=<hmac-sha256 of "t=1710000000">
+x-freshdesk-domain: acme
+x-freshdesk-api-key: <api key>
+```
+
+Single-tenant HTTP (`AUTH_MODE=env`) still requires a valid `X-Gateway-S2S` header. Vendor credentials then come from `FRESHDESK_DOMAIN` and `FRESHDESK_API_KEY`.
 
 ## Tool Overview
 
@@ -78,15 +105,40 @@ Read tools (search/list/get/autocomplete/status) carry no warning and are marked
 
 ## Docker Deployment
 
-See [docker-compose.yml](docker-compose.yml). Copy `.env.example` to `.env` and fill in your credentials:
+The image listens on `0.0.0.0` inside the container (`MCP_HTTP_HOST`) and defaults to `AUTH_MODE=gateway`. Publish the port on loopback and pass the S2S secret. In gateway mode the domain and API key arrive on each request as `x-freshdesk-domain` and `x-freshdesk-api-key`. They are not read from the environment.
 
 ```bash
-cp .env.example .env
-# Edit .env: FRESHDESK_DOMAIN and FRESHDESK_API_KEY
-docker compose up -d
+docker run \
+  -e CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" \
+  -p 127.0.0.1:8080:8080 \
+  freshdesk-mcp
 ```
 
-The build installs `@wyre-technology/node-freshdesk` from GitHub Packages via a
+Compose refuses to start when `CONDUIT_S2S_SECRET` is unset, sets `AUTH_MODE=gateway`, publishes `127.0.0.1:8080:8080`, and does not set `FRESHDESK_DOMAIN`, `FRESHDESK_API_KEY`, or `env_file`:
+
+```bash
+CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" docker compose up -d
+```
+
+Single-tenant HTTP (`AUTH_MODE=env`) still requires the S2S secret, then uses `FRESHDESK_DOMAIN` and `FRESHDESK_API_KEY`:
+
+```bash
+docker run \
+  -e CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" \
+  -e AUTH_MODE=env \
+  -e FRESHDESK_DOMAIN=your-subdomain \
+  -e FRESHDESK_API_KEY=your-api-key \
+  -p 127.0.0.1:8080:8080 \
+  freshdesk-mcp
+```
+
+Local HTTP without a secret is development-only. It binds `127.0.0.1` even when `MCP_HTTP_HOST` is `0.0.0.0`, and logs a warning. A known placeholder secret still refuses to start:
+
+```bash
+MCP_ALLOW_INSECURE_DEV=1 npm run start:http
+```
+
+See [docker-compose.yml](docker-compose.yml). The build installs `@wyre-technology/node-freshdesk` from GitHub Packages via a
 BuildKit npmrc secret (never baked into a layer):
 
 ```bash
@@ -105,6 +157,12 @@ npm run dev         # Watch mode
 npm run test        # Run tests
 npm run lint        # Type-check
 npm run clean       # Remove dist/
+
+# HTTP refuses to start until CONDUIT_S2S_SECRET is set
+CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" npm run start:http
+
+# Local HTTP only, without a service-to-service secret (always binds 127.0.0.1)
+MCP_ALLOW_INSECURE_DEV=1 npm run start:http
 ```
 
 ## Testing
